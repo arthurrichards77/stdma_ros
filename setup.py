@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
                 'talker = stdma_ros.stdma_talker:main',
+                'timer = stdma_ros.stdma_timer:main',
         ],
     },
 )

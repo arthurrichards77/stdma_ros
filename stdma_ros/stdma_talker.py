@@ -13,35 +13,118 @@
 # limitations under the License.
 
 import os
-import re
+import random
 import rclpy
 from rclpy.node import Node
 
-from std_msgs.msg import String
-
+from std_msgs.msg import Int32, Bool
 
 class StdmaTalker(Node):
 
     def __init__(self):
-        self.node_name = f'stdma_talker_{os.getpid()}'
-        super().__init__(self.node_name)
+        self.node_id = os.getpid()
+        random.seed(self.node_id)
+        super().__init__('stdma_talker_%d' % self.node_id)
         self.frame = 0
-        self.slot = 0
+        self.slot = -1
         self.num_slots = 10
         self.state = 'listen'
-        self.my_slot = -1
+        self.my_slot = -2
         self.slot_allocations = [None]*self.num_slots
         self.inbox = []
-        self.publisher_ = self.create_publisher(String, 'topic', 10)
-        timer_period = 1.0  # seconds
-        self.subscription = self.create_subscription(
-            String,
-            'topic',
-            self.subscriber_callback,
+        self.control_sub = self.create_subscription(
+            Int32,
+            'stdma/control',
+            self.control_callback,
             10)
-        self.timer = self.create_timer(timer_period, self.timer_callback)
+        self.control_pub = self.create_publisher(Int32,'stdma/control',10)
+        self.timer_sub = self.create_subscription(
+            Bool,
+            'stdma/timer',
+            self.timer_callback,
+            10)
 
-    def timer_callback(self):
+    def control_callback(self, msg):
+        self.inbox.append(msg)
+
+    def get_messages(self):
+        received_messages = []
+        num_messages = len(self.inbox)
+        for ii in range(num_messages):
+            received_messages.append(self.inbox.pop(0))
+        return received_messages
+
+    def timer_callback(self, msg):
+        if msg.data:
+            # rising edge - start/end of slot
+            self.end_slot_callback()
+        else:
+            # falling edge - middle of slot
+            self.mid_slot_callback()
+
+    def end_slot_callback(self):
+        if self.slot==-1:
+            # first ever run - need to wait for end of first slot
+            self.slot = 0
+            self.get_logger().info('Start of slot 0 frame 0')
+        else:
+            self.get_logger().info('End of slot %d frame %d' % (self.slot, self.frame))
+            # end of slot - check received messages
+            received_messages = self.get_messages()
+            num_messages = len(received_messages)
+            if num_messages==0:
+                self.get_logger().info('Slot %d looks empty' % self.slot)
+                self.slot_allocations[self.slot] = None
+            elif num_messages==1:
+                msg = received_messages[0]
+                sender = msg.data
+                self.get_logger().info('Slot %d allocated to %d' % (self.slot, sender))
+                self.slot_allocations[self.slot] = sender
+                if sender==self.node_id:
+                    # my own message - means successfully in channel
+                    self.state = 'in'
+                    self.get_logger().info('Secured my own slot')
+            elif num_messages>1:
+                # more than one message in a slot - collision
+                colliding_ids = [m.data for m in received_messages]
+                self.get_logger().warning('Collision between %s' % colliding_ids.__str__())
+                self.slot_allocations[self.slot] = None
+                if self.node_id in colliding_ids:
+                    self.get_logger().warning('Lost my slot due to collision')
+                    self.state = 'listen'
+                    self.my_slot = -2
+            if self.state == 'check':
+                # successful join would have changed state to 'in' 
+                # collision would have changed to 'listen'
+                # so this must mean lost data
+                self.state = 'listen'
+                self.my_slot = -2
+            # update for next slot
+            self.slot += 1
+            if self.slot==self.num_slots:
+                self.slot = 0
+                self.frame += 1
+                if self.state == 'listen':
+                    # have listened to a whole frame - time to try and get in
+                    self.state = 'enter'
+                    available_slots = [ii for ii in range(self.num_slots) if self.slot_allocations[ii]==None]
+                    self.my_slot = random.sample(available_slots, 1)[0]
+                    self.get_logger().info('Will try to enter at slot %d' % self.my_slot)
+            self.get_logger().info('Slot allocations: %s' % self.slot_allocations.__str__())
+            self.get_logger().info('State: "%s" my slot: %d' % (self.state, self.my_slot))
+
+    def mid_slot_callback(self):
+        if self.slot>=0:
+            self.get_logger().info('Middle of slot %d frame %d' % (self.slot, self.frame))
+            if self.slot==self.my_slot:
+                msg = Int32()
+                msg.data = self.node_id
+                self.control_pub.publish(msg)
+                self.state = 'check'
+                self.get_logger().info('Sent my control message')
+
+
+    def rubbish():
         received_messages = self.get_messages()
         previous_slot = (self.slot-1) % self.num_slots
         if len(received_messages)==1:
@@ -85,16 +168,6 @@ class StdmaTalker(Node):
                     self.my_slot = available_slots[0]
         self.get_logger().info('State %s my slot %d allocs %s' % (self.state, self.my_slot, self.slot_allocations.__str__()))
 
-
-    def subscriber_callback(self, msg):
-        self.inbox.append(msg)
-
-    def get_messages(self):
-        received_messages = []
-        num_messages = len(self.inbox)
-        for ii in range(num_messages):
-            received_messages.append(self.inbox.pop(0))
-        return received_messages
 
 def main(args=None):
     rclpy.init(args=args)
